@@ -6,6 +6,9 @@
 <p align="center">
   A lightweight Windows app that intercepts links and routes them to the right browser automatically.
 </p>
+<p align="center">
+There's an [android app](https://github.com/vdb86/urlrouter) as well.
+</p>
 
 Route every link opened on Windows to the right browser automatically —
 based on configurable rules, with a floating chooser popup as fallback.
