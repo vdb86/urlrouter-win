@@ -1,5 +1,5 @@
 """
-tray.py — System-tray icon with right-click context menu.
+tray.py - System-tray icon with right-click context menu.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ class TrayIcon(QSystemTrayIcon):
         self._config = config
         self._app = app_ref
 
-        self.setToolTip("URL Router — routing URLs to the right browser")
+        self.setToolTip("URL Router - routing URLs to the right browser")
         self._build_menu()
         self.activated.connect(self._on_activated)
 

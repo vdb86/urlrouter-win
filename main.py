@@ -1,5 +1,5 @@
 """
-main.py — URL Router entry point.
+main.py - URL Router entry point.
 
 Startup sequence
 ────────────────
@@ -49,23 +49,56 @@ def _parse_url() -> str | None:
     return None
 
 
+def _fallback_open(url: str) -> None:
+    """The running instance did not answer: rather than lose the link, open
+    it in the default fallback browser (or the first enabled one). No Qt."""
+    try:
+        import subprocess
+        from config import Config
+        cfg = Config()
+        browser = cfg.get_default_browser() or next(iter(cfg.get_enabled_browsers()), None)
+        if browser and browser.get("exe_path"):
+            subprocess.Popen([browser["exe_path"], url], close_fds=True)
+            _log(f"fallback-opened in {browser.get('name')}")
+    except Exception as exc:
+        _log(f"fallback open failed: {exc}")
+
+
 def main() -> None:
     _log(f"process entered main(), argv={sys.argv[1:]}")
     url_arg = _parse_url()
+
+    # Which app was the link clicked in? Asked first, while that app is
+    # still our parent and still in the foreground.
+    source = None
+    if url_arg:
+        from source_app import detect_source
+        source = detect_source()
+        _log(f"source app: {source}")
 
     # ── Single-instance gate ────────────────────────────────────────────
     from ipc import acquire_mutex, send_to_existing
     _log("imported ipc")
 
     if not acquire_mutex():
-        _log("mutex held by another instance — forwarding URL")
+        _log("mutex held by another instance - forwarding URL")
         if url_arg:
-            ok = send_to_existing(url_arg)
+            # This short-lived process was started by the app the user
+            # clicked in, so it may take the foreground; pass that right on
+            # so the tray instance's chooser can come to the front and get
+            # keyboard focus (Escape, click-outside-to-close).
+            try:
+                ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+            except Exception:
+                pass
+            ok = send_to_existing(url_arg, source)
             _log(f"send_to_existing returned {ok}")
+            if not ok:
+                _fallback_open(url_arg)
         _log("second instance exiting")
         sys.exit(0)
 
-    _log("acquired mutex — this is the first instance")
+    _log("acquired mutex - this is the first instance")
 
     # ── DPI awareness (must happen before QApplication) ─────────────────
     try:
@@ -109,7 +142,7 @@ def main() -> None:
     _log("app initialized, tray shown")
 
     if url_arg:
-        router_app.handle_url(url_arg)
+        router_app.handle_url(url_arg, source)
         _log("handled startup URL")
 
     sys.exit(qt_app.exec())

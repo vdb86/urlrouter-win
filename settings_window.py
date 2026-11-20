@@ -1,5 +1,5 @@
 """
-settings_window.py — Full settings UI with six tabs:
+settings_window.py - Full settings UI with six tabs:
     Browsers · Rules · Appearance · General · Import/Export · Diagnostics
 """
 from __future__ import annotations
@@ -9,16 +9,16 @@ import os
 import uuid
 from typing import TYPE_CHECKING, Optional
 
-from PyQt6.QtCore import Qt, QSize, QRect
+from PyQt6.QtCore import Qt, QPoint, QSize, QRect, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QBrush, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap,
 )
 from PyQt6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QPushButton, QRadioButton, QScrollArea,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QTableWidget,
+    QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMainWindow, QMenu, QMessageBox, QPushButton, QRadioButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
     QApplication, QHeaderView,
 )
@@ -27,12 +27,17 @@ if TYPE_CHECKING:
     from app import URLRouterApp
     from config import Config
 
-from router import MATCH_TYPE_LABELS, MATCH_TYPES, diagnose, hostname_from_url
+from router import (
+    ACTION_ASK, ACTION_EXCLUDE, ACTION_LABELS, ACTION_OPEN, ACTIONS,
+    MATCH_TYPE_LABELS, MATCH_TYPES, auto_rule_name, decide,
+    describe_conditions, describe_source, normalize_exe, normalize_pattern,
+    rule_display_name, validate_condition,
+)
 import theme as _theme
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Live appearance preview  (right panel — renders actual ChooserWindow)
+#  Live appearance preview  (right panel - renders actual ChooserWindow)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _LivePreview(QWidget):
@@ -51,7 +56,7 @@ class _LivePreview(QWidget):
         from copy import deepcopy
         from chooser import ChooserWindow
 
-        # Minimal config proxy — real browsers, preview appearance
+        # Minimal config proxy - real browsers, preview appearance
         real_browsers = self._config.get_enabled_browsers()
         preview_data  = deepcopy(self._config.to_dict())
         preview_data["appearance"].update(ap)
@@ -156,22 +161,108 @@ def _section_label(text: str) -> QLabel:
 #  Rule dialog
 # ══════════════════════════════════════════════════════════════════════════════
 
+_PATTERN_HINTS = {
+    "exact_hostname":    "e.g. google.com",
+    "wildcard_hostname": "e.g. *.youtube.com",
+    "url_prefix":        "e.g. https://youtube.com/watch",
+    "contains":          "e.g. reddit",
+    "regex":             r"e.g. github\.com/.*/issues",
+}
+
+
+class _ConditionRow(QWidget):
+    """One 'match type + pattern' line in the rule editor."""
+    remove_requested = pyqtSignal(object)
+    changed          = pyqtSignal()
+
+    def __init__(self, match_type: str = MATCH_TYPES[0], pattern: str = "",
+                 parent=None) -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+
+        self.type_combo = QComboBox()
+        for mt in MATCH_TYPES:
+            self.type_combo.addItem(MATCH_TYPE_LABELS[mt], mt)
+        idx = self.type_combo.findData(match_type)
+        self.type_combo.setCurrentIndex(max(0, idx))
+        self.type_combo.setFixedWidth(160)
+        row.addWidget(self.type_combo)
+
+        self.pattern_edit = QLineEdit(pattern)
+        row.addWidget(self.pattern_edit, 1)
+
+        self.remove_btn = QPushButton("✕")
+        # The global button padding (16px each side) would hide the glyph.
+        self.remove_btn.setStyleSheet("padding: 0px; font-size: 14px;")
+        self.remove_btn.setFixedWidth(36)
+        self.remove_btn.setToolTip("Remove this condition")
+        self.remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        row.addWidget(self.remove_btn)
+
+        self.type_combo.currentIndexChanged.connect(self._on_type_changed)
+        self.pattern_edit.textChanged.connect(lambda _: self.changed.emit())
+        self._on_type_changed()
+
+    def _on_type_changed(self, *_) -> None:
+        self.pattern_edit.setPlaceholderText(
+            _PATTERN_HINTS.get(self.type_combo.currentData(), ""))
+        self.changed.emit()
+
+    def value(self) -> dict:
+        mt = self.type_combo.currentData()
+        return {"match_type": mt,
+                "pattern": normalize_pattern(mt, self.pattern_edit.text())}
+
+
 class RuleDialog(QDialog):
+    """Editor for one rule: name, action, conditions (OR-ed) and browsers."""
+
     def __init__(self, parent, config: "Config", rule: Optional[dict] = None) -> None:
         super().__init__(parent)
         self._config = config
         self._rule = rule
+        self._cond_rows: list[_ConditionRow] = []
         self.setWindowTitle("Edit Rule" if rule else "Add Rule")
         self.setModal(True)
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(320)
+        # Section titles sit ABOVE the group frame here, not on its top line,
+        # where they overlapped the frame and the first row of controls.
+        self.setStyleSheet(
+            "QGroupBox { margin-top: 24px; padding-top: 8px; }"
+            "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;"
+            " top: 0px; left: 2px; margin-left: 0px; padding: 0 4px; }"
+        )
         self._build()
-        if rule:
-            self._load(rule)
+        self._load(rule or {})
+        self._fit_height(grow_only=False)
+
+    # ---------------------------------------------------------------- build
 
     def _build(self) -> None:
-        layout = QVBoxLayout(self)
+        # Everything above OK / Cancel scrolls, so a rule with many conditions
+        # never pushes the buttons (or anything else) off screen.
+        outer = QVBoxLayout(self)
+        outer.setSpacing(0)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self._scroll.viewport().setAutoFillBackground(False)
+        self._content = QWidget()
+        self._content.setObjectName("ruleContent")
+        self._content.setStyleSheet("#ruleContent { background: transparent; }")
+        self._scroll.setWidget(self._content)
+        outer.addWidget(self._scroll, 1)
+
+        layout = QVBoxLayout(self._content)
         layout.setSpacing(14)
-        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setContentsMargins(20, 20, 20, 12)
 
         form = QFormLayout()
         form.setSpacing(10)
@@ -181,81 +272,430 @@ class RuleDialog(QDialog):
         self._enabled_cb.setChecked(True)
         form.addRow("", self._enabled_cb)
 
-        self._type_combo = QComboBox()
-        for mt in MATCH_TYPES:
-            self._type_combo.addItem(MATCH_TYPE_LABELS[mt], mt)
-        form.addRow("Match type:", self._type_combo)
+        self._name_edit = QLineEdit()
+        self._name_edit.setToolTip("Leave empty to use the automatic name shown in grey.")
+        form.addRow("Name:", self._name_edit)
 
-        self._pattern_edit = QLineEdit()
-        self._pattern_edit.setPlaceholderText("e.g. google.com")
-        form.addRow("Pattern:", self._pattern_edit)
-
-        self._browser_combo = QComboBox()
-        for b in self._config.get_enabled_browsers():
-            self._browser_combo.addItem(b["name"], b["id"])
-        form.addRow("Browser:", self._browser_combo)
-
+        self._action_combo = QComboBox()
+        for a in ACTIONS:
+            self._action_combo.addItem(ACTION_LABELS[a], a)
+        form.addRow("Action:", self._action_combo)
         layout.addLayout(form)
 
-        hint = QLabel()
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color: #888; font-size: 11px;")
-        self._type_combo.currentIndexChanged.connect(
-            lambda _: hint.setText(self._hint_for_type(
-                self._type_combo.currentData()
-            ))
-        )
-        hint.setText(self._hint_for_type(MATCH_TYPES[0]))
-        layout.addWidget(hint)
+        # ── When ─────────────────────────────────────────────────────
+        when_group = QGroupBox("When the link matches any of")
+        wl = QVBoxLayout(when_group)
+        wl.setSpacing(8)
+        self._cond_box = QVBoxLayout()
+        self._cond_box.setSpacing(6)
+        wl.addLayout(self._cond_box)
+        add_row = QHBoxLayout()
+        add_cond_btn = QPushButton("＋  Add condition")
+        add_cond_btn.clicked.connect(lambda: self._add_condition())
+        add_row.addWidget(add_cond_btn)
+        add_row.addStretch()
+        wl.addLayout(add_row)
+        self._no_cond_hint = QLabel(
+            "No conditions: the rule applies to every link from the apps chosen below.")
+        self._no_cond_hint.setWordWrap(True)
+        self._no_cond_hint.setStyleSheet("color: #888; font-size: 12px;")
+        wl.addWidget(self._no_cond_hint)
+        layout.addWidget(when_group)
 
-        layout.addWidget(_separator())
+        # ── Only when opened from ─────────────────────────────────
+        src_group = QGroupBox("Only when opened from")
+        sl = QVBoxLayout(src_group)
+        sl.setSpacing(8)
+        self._src_mode = QComboBox()
+        self._src_mode.addItem("Any app", "any")
+        self._src_mode.addItem("Only these apps", "only")
+        self._src_mode.addItem("Any app except these", "except")
+        self._src_mode.setFixedWidth(220)
+        sl.addWidget(self._src_mode)
+        self._src_list = QListWidget()
+        self._src_list.setMaximumHeight(100)
+        self._src_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        sl.addWidget(self._src_list)
+        src_btns = QHBoxLayout()
+        self._src_add_btn = QPushButton("＋  Add app")
+        self._src_add_btn.clicked.connect(self._show_add_app_menu)
+        src_btns.addWidget(self._src_add_btn)
+        self._src_remove_btn = QPushButton("Remove")
+        self._src_remove_btn.clicked.connect(self._remove_source_apps)
+        src_btns.addWidget(self._src_remove_btn)
+        src_btns.addStretch()
+        sl.addLayout(src_btns)
+        src_hint = QLabel("When the app is not known, rules limited to apps are skipped.")
+        src_group.setToolTip(
+            "The app is the program that asked Windows to open the link, or the "
+            "window in front when that program is a Windows helper.")
+        src_hint.setStyleSheet("color: #888; font-size: 12px;")
+        sl.addWidget(src_hint)
+        layout.addWidget(src_group)
+        self._src_mode.currentIndexChanged.connect(self._on_source_mode_changed)
 
+        # ── Then ─────────────────────────────────────────────────────
+        then_group = QGroupBox("Then")
+        tl = QVBoxLayout(then_group)
+        self._then_stack = QStackedWidget()
+        tl.addWidget(self._then_stack)
+
+        # open
+        open_page = QWidget()
+        ol = QFormLayout(open_page)
+        ol.setContentsMargins(0, 0, 0, 0)
+        self._browser_combo = QComboBox()
+        for b in self._config.browsers:
+            label = b.get("name", b.get("id", "?"))
+            if not b.get("enabled", True):
+                label += "  (disabled)"
+            self._browser_combo.addItem(label, b.get("id"))
+        ol.addRow("Open in:", self._browser_combo)
+        self._private_cb = QCheckBox("Open in a private / incognito window")
+        ol.addRow("", self._private_cb)
+        self._then_stack.addWidget(open_page)
+
+        # exclude
+        self._exclude_list = self._browser_check_list()
+        self._then_stack.addWidget(self._labelled(
+            "Never offer these browsers for matching links. A rule that opens "
+            "one of them is skipped, and they are left out of the chooser.",
+            self._exclude_list))
+
+        # ask
+        self._ask_list = self._browser_check_list()
+        self._then_stack.addWidget(self._labelled(
+            "Always show the chooser for matching links, even when a default "
+            "browser is set. Offer only the browsers ticked below "
+            "(none ticked = all enabled browsers).",
+            self._ask_list))
+
+        layout.addWidget(then_group)
+
+        self._action_combo.currentIndexChanged.connect(self._on_action_changed)
+        self._browser_combo.currentIndexChanged.connect(self._update_auto_name)
+        self._private_cb.toggled.connect(self._update_auto_name)
+        self._exclude_list.itemChanged.connect(self._update_auto_name)
+        self._ask_list.itemChanged.connect(self._update_auto_name)
+
+        layout.addStretch()
+
+        self._footer = QWidget()
+        self._footer.setObjectName("ruleFooter")
+        self._footer.setStyleSheet("#ruleFooter { background: transparent; }")
+        fl = QVBoxLayout(self._footer)
+        fl.setSpacing(14)
+        fl.setContentsMargins(20, 0, 20, 20)
+        fl.addWidget(_separator())
         btns = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         btns.accepted.connect(self._validate_and_accept)
         btns.rejected.connect(self.reject)
-        layout.addWidget(btns)
+        fl.addWidget(btns)
+        outer.addWidget(self._footer)
 
-    def _hint_for_type(self, mt: str) -> str:
-        hints = {
-            "exact_hostname":    "Match the exact hostname, e.g. google.com",
-            "wildcard_hostname": "Match subdomains, e.g. *.youtube.com",
-            "url_prefix":        "URL must start with this, e.g. https://youtube.com/watch",
-            "contains":          "URL must contain this text, e.g. reddit",
-            "regex":             r"Regular expression, e.g. .*github\.com\/.*issues.*",
-        }
-        return hints.get(mt, "")
+    def _fit_height(self, grow_only: bool = True) -> None:
+        """Make the dialog tall enough for its content, up to 90% of the
+        screen; beyond that the content scrolls."""
+        screen = self.screen() or QApplication.primaryScreen()
+        limit = int(screen.availableGeometry().height() * 0.9) if screen else 900
+        want = (self._content.sizeHint().height() + self._footer.sizeHint().height()
+                + 2 * self._scroll.frameWidth())
+        want = min(want, limit)
+        if not grow_only or want > self.height():
+            self.resize(max(self.width(), 560), want)
+
+    def _browser_check_list(self) -> QListWidget:
+        lst = QListWidget()
+        lst.setMaximumHeight(140)
+        for b in self._config.browsers:
+            label = b.get("name", b.get("id", "?"))
+            if not b.get("enabled", True):
+                label += "  (disabled)"
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, b.get("id"))
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            lst.addItem(item)
+        return lst
+
+    @staticmethod
+    def _labelled(text: str, widget: QWidget) -> QWidget:
+        page = QWidget()
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 0, 0, 0)
+        lbl = QLabel(text)
+        lbl.setWordWrap(True)
+        lbl.setStyleSheet("color: #888; font-size: 12px;")
+        vl.addWidget(lbl)
+        vl.addWidget(widget)
+        return page
+
+    # ----------------------------------------------------------- conditions
+
+    def _add_condition(self, match_type: str = MATCH_TYPES[0], pattern: str = "") -> None:
+        row = _ConditionRow(match_type, pattern)
+        row.remove_requested.connect(self._remove_condition)
+        row.changed.connect(self._update_auto_name)
+        self._cond_rows.append(row)
+        self._cond_box.addWidget(row)
+        self._sync_remove_buttons()
+        self._update_auto_name()
+        row.pattern_edit.setFocus()
+        if self.isVisible():
+            # Grow up to the screen limit, then keep the new row in view.
+            QTimer.singleShot(0, lambda r=row: self._after_condition_added(r))
+
+    def _after_condition_added(self, row: _ConditionRow) -> None:
+        self._fit_height()
+
+        def _show_row() -> None:
+            try:
+                self._scroll.ensureWidgetVisible(row, 0, 40)
+            except RuntimeError:
+                pass
+        # After the resize has been laid out, or the row lands half hidden.
+        QTimer.singleShot(0, _show_row)
+
+    def _remove_condition(self, row: _ConditionRow) -> None:
+        # Down to zero is allowed: with a source filter that means "every
+        # link from those apps"; without one, OK refuses it.
+        self._cond_rows.remove(row)
+        self._cond_box.removeWidget(row)
+        row.deleteLater()
+        self._sync_remove_buttons()
+        self._update_auto_name()
+
+    def _sync_remove_buttons(self) -> None:
+        if hasattr(self, "_no_cond_hint"):
+            self._no_cond_hint.setVisible(not self._cond_rows)
+
+    # ---------------------------------------------------------- source apps
+
+    def _source_apps(self) -> list:
+        return [self._src_list.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(self._src_list.count())]
+
+    def _on_source_mode_changed(self, *_) -> None:
+        on = self._src_mode.currentData() != "any"
+        self._src_list.setEnabled(on)
+        self._src_remove_btn.setEnabled(on)
+        self._update_auto_name()
+
+    def _add_source_app(self, exe: str, name: str = "", path: str = "") -> None:
+        exe = normalize_exe(exe)
+        if not exe:
+            return
+        if name or path:
+            self._config.note_source_app(exe, name, path)
+        if exe not in self._source_apps():
+            item = QListWidgetItem(f"{self._config.app_name(exe)}   ({exe})")
+            item.setData(Qt.ItemDataRole.UserRole, exe)
+            self._src_list.addItem(item)
+        if self._src_mode.currentData() == "any":
+            self._src_mode.setCurrentIndex(self._src_mode.findData("only"))
+        self._update_auto_name()
+
+    def _remove_source_apps(self) -> None:
+        for item in self._src_list.selectedItems():
+            self._src_list.takeItem(self._src_list.row(item))
+        self._update_auto_name()
+
+    def _show_add_app_menu(self) -> None:
+        menu = QMenu(self)
+        present = set(self._source_apps())
+
+        def header(text: str) -> None:
+            act = menu.addAction(text)
+            act.setEnabled(False)
+
+        known = sorted(self._config.known_apps.items(),
+                       key=lambda kv: -(kv[1].get("last_seen") or 0))
+        if known:
+            header("Links came from")
+            for exe, info in known:
+                act = menu.addAction(f"    {self._config.app_name(exe)}   ({exe})")
+                act.setEnabled(exe not in present)
+                act.triggered.connect(lambda _=False, e=exe: self._add_source_app(e))
+
+        try:
+            from source_app import display_name, list_window_apps
+            windows = [w for w in list_window_apps()
+                       if w["exe"] not in self._config.known_apps]
+        except Exception:
+            windows = []
+        if windows:
+            if known:
+                menu.addSeparator()
+            header("Open windows")
+            for w in windows:
+                name = display_name(w["path"], w["exe"])
+                act = menu.addAction(f"    {name}   ({w['exe']})")
+                act.setEnabled(w["exe"] not in present)
+                act.triggered.connect(
+                    lambda _=False, e=w["exe"], n=name, p=w["path"]:
+                        self._add_source_app(e, n, p))
+
+        if known or windows:
+            menu.addSeparator()
+        menu.addAction("Browse for a program…", self._browse_source_app)
+        menu.addAction("Type a program name…", self._type_source_app)
+        menu.exec(self._src_add_btn.mapToGlobal(QPoint(0, self._src_add_btn.height())))
+
+    def _browse_source_app(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a program", "", "Programs (*.exe);;All files (*)")
+        if not path:
+            return
+        path = os.path.normpath(path)
+        exe = normalize_exe(path)
+        try:
+            from source_app import display_name
+            name = display_name(path, exe)
+        except Exception:
+            name = ""
+        self._add_source_app(exe, name, path)
+
+    def _type_source_app(self) -> None:
+        text, ok = QInputDialog.getText(
+            self, "Add app", "Program file name (for example slack.exe):")
+        if ok and text.strip():
+            self._add_source_app(text)
+
+    # ---------------------------------------------------------------- state
+
+    def _on_action_changed(self, *_) -> None:
+        self._then_stack.setCurrentIndex(max(0, self._action_combo.currentIndex()))
+        self._update_auto_name()
+
+    @staticmethod
+    def _checked_ids(lst: QListWidget) -> list:
+        return [lst.item(i).data(Qt.ItemDataRole.UserRole)
+                for i in range(lst.count())
+                if lst.item(i).checkState() == Qt.CheckState.Checked]
+
+    @staticmethod
+    def _set_checked(lst: QListWidget, ids: list) -> None:
+        for i in range(lst.count()):
+            it = lst.item(i)
+            it.setCheckState(Qt.CheckState.Checked
+                             if it.data(Qt.ItemDataRole.UserRole) in ids
+                             else Qt.CheckState.Unchecked)
+
+    def _update_auto_name(self, *_) -> None:
+        if not hasattr(self, "_name_edit"):
+            return
+        try:
+            auto = auto_rule_name(self._current_rule(), self._config.browser_name,
+                                  self._config.app_name)
+        except Exception:
+            auto = ""
+        self._name_edit.setPlaceholderText(auto)
 
     def _load(self, rule: dict) -> None:
         self._enabled_cb.setChecked(rule.get("enabled", True))
-        mt = rule.get("match_type", MATCH_TYPES[0])
-        idx = self._type_combo.findData(mt)
-        if idx >= 0:
-            self._type_combo.setCurrentIndex(idx)
-        self._pattern_edit.setText(rule.get("pattern", ""))
+        self._name_edit.setText(rule.get("name", ""))
+        action = rule.get("action", ACTION_OPEN)
+        self._action_combo.setCurrentIndex(max(0, self._action_combo.findData(action)))
+        self._then_stack.setCurrentIndex(max(0, self._action_combo.currentIndex()))
+
+        conds = rule.get("conditions") or []
+        if not conds and not rule.get("source_apps"):
+            conds = [{"match_type": MATCH_TYPES[0], "pattern": ""}]
+        for c in conds:
+            self._add_condition(c.get("match_type", MATCH_TYPES[0]), c.get("pattern", ""))
+
         bid = rule.get("browser_id", "")
-        idx2 = self._browser_combo.findData(bid)
-        if idx2 >= 0:
-            self._browser_combo.setCurrentIndex(idx2)
+        idx = self._browser_combo.findData(bid)
+        if idx >= 0:
+            self._browser_combo.setCurrentIndex(idx)
+        elif bid and action == ACTION_OPEN:
+            # Keep the rule's target even if that browser was removed, so
+            # pressing OK never retargets the rule silently.
+            self._browser_combo.addItem(f"{bid}  (missing)", bid)
+            self._browser_combo.setCurrentIndex(self._browser_combo.count() - 1)
+        else:
+            # Pre-select the first enabled browser for a new rule.
+            for i, b in enumerate(self._config.browsers):
+                if b.get("enabled", True):
+                    self._browser_combo.setCurrentIndex(i)
+                    break
+        self._private_cb.setChecked(bool(rule.get("private", False)))
+
+        apps = rule.get("source_apps") or []
+        for exe in apps:
+            self._add_source_app(exe)
+        mode = ("except" if rule.get("source_except") else "only") if apps else "any"
+        self._src_mode.setCurrentIndex(self._src_mode.findData(mode))
+        self._on_source_mode_changed()
+        self._sync_remove_buttons()
+
+        ids = rule.get("browsers", []) or []
+        if action == ACTION_EXCLUDE:
+            self._set_checked(self._exclude_list, ids)
+        elif action == ACTION_ASK:
+            self._set_checked(self._ask_list, ids)
+        self._update_auto_name()
+
+    def _current_rule(self) -> dict:
+        action = self._action_combo.currentData()
+        rule = {
+            "id": self._rule["id"] if self._rule else str(uuid.uuid4()),
+            "enabled": self._enabled_cb.isChecked(),
+            "name": self._name_edit.text().strip(),
+            "action": action,
+            "conditions": [r.value() for r in self._cond_rows],
+            "source_apps": [],
+            "source_except": False,
+            "browser_id": "",
+            "private": False,
+            "browsers": [],
+        }
+        mode = self._src_mode.currentData()
+        if mode != "any":
+            rule["source_apps"] = self._source_apps()
+            rule["source_except"] = mode == "except" and bool(rule["source_apps"])
+        # With a source filter, untouched empty condition rows mean "any link".
+        if rule["source_apps"] and all(not c["pattern"] for c in rule["conditions"]):
+            rule["conditions"] = []
+        if action == ACTION_OPEN:
+            rule["browser_id"] = self._browser_combo.currentData() or ""
+            rule["private"] = self._private_cb.isChecked()
+        elif action == ACTION_EXCLUDE:
+            rule["browsers"] = self._checked_ids(self._exclude_list)
+        else:
+            rule["browsers"] = self._checked_ids(self._ask_list)
+        return rule
 
     def _validate_and_accept(self) -> None:
-        if not self._pattern_edit.text().strip():
-            QMessageBox.warning(self, "Validation", "Pattern cannot be empty.")
+        rule = self._current_rule()
+        if self._src_mode.currentData() != "any" and not rule["source_apps"]:
+            QMessageBox.warning(self, "Validation",
+                                "Add at least one app, or choose “Any app”.")
             return
-        if self._browser_combo.count() == 0:
+        if not rule["conditions"] and not rule["source_apps"]:
+            QMessageBox.warning(
+                self, "Validation",
+                "Add a condition, or choose the apps under “Only when opened from”.")
+            return
+        for i, c in enumerate(rule["conditions"], 1):
+            err = validate_condition(c["match_type"], c["pattern"])
+            if err:
+                which = f"Condition {i}: " if len(rule["conditions"]) > 1 else ""
+                QMessageBox.warning(self, "Validation", which + err)
+                self._cond_rows[i - 1].pattern_edit.setFocus()
+                return
+        if rule["action"] == ACTION_OPEN and not rule["browser_id"]:
             QMessageBox.warning(self, "Validation", "No browsers available.")
+            return
+        if rule["action"] == ACTION_EXCLUDE and not rule["browsers"]:
+            QMessageBox.warning(self, "Validation", "Tick at least one browser to never offer.")
             return
         self.accept()
 
     def get_rule(self) -> dict:
-        return {
-            "id": self._rule["id"] if self._rule else str(uuid.uuid4()),
-            "enabled": self._enabled_cb.isChecked(),
-            "match_type": self._type_combo.currentData(),
-            "pattern": self._pattern_edit.text().strip(),
-            "browser_id": self._browser_combo.currentData(),
-        }
+        return self._current_rule()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -341,8 +781,11 @@ class SettingsWindow(QMainWindow):
         self._app = app_ref
         self._theme_mode = _theme.resolve_theme(config.general.get("theme", "system"))
         self._browser_rows: list[BrowserRowWidget] = []
+        # Free the window (and its live preview) when closed; the app
+        # creates a fresh one next time.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
-        self.setWindowTitle("URL Router — Settings")
+        self.setWindowTitle("URL Router - Settings")
         self.setMinimumSize(780, 580)
         self.resize(860, 640)
 
@@ -400,6 +843,9 @@ class SettingsWindow(QMainWindow):
         self._tabs.addTab(self._tab_general(),     "  General  ")
         self._tabs.addTab(self._tab_importexport(),"  Import / Export  ")
         self._tabs.addTab(self._tab_diagnostics(), "  Diagnostics  ")
+        self._tabs.currentChanged.connect(
+            lambda i: self._refresh_recent_sources()
+            if "Diagnostics" in self._tabs.tabText(i) else None)
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # TAB: Browsers
@@ -416,7 +862,7 @@ class SettingsWindow(QMainWindow):
 
         fallback_desc = QLabel(
             'When no rule matches a URL, send it here directly.\n'
-            'Choose "\u2014 Show chooser \u2014" to pick manually each time.'
+            'Choose "- Show chooser -" to pick manually each time.'
         )
         fallback_desc.setWordWrap(True)
         fallback_desc.setStyleSheet("color: #888; font-size: 12px;")
@@ -435,6 +881,9 @@ class SettingsWindow(QMainWindow):
         vbox.addWidget(_section_label("Installed browsers"))
 
         self._browser_list = QListWidget()
+        # Rows are item widgets of a fixed height: the global item padding
+        # would make the highlight a different size from the row it marks.
+        self._browser_list.setStyleSheet("QListWidget::item { padding: 0px; margin: 0px; }")
         self._browser_list.setAlternatingRowColors(True)
         self._browser_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self._browser_list.setDefaultDropAction(Qt.DropAction.MoveAction)
@@ -472,10 +921,13 @@ class SettingsWindow(QMainWindow):
         """Rebuild the fallback-browser combo without triggering saves."""
         self._default_combo.blockSignals(True)
         self._default_combo.clear()
-        self._default_combo.addItem("— Show chooser popup (no default) —", "")
+        self._default_combo.addItem("- Show chooser popup (no default) -", "")
         current_default = ""
         for b in self._config.browsers:
-            self._default_combo.addItem(b["name"], b["id"])
+            label = b.get("name", b["id"])
+            if not b.get("enabled", True):
+                label += "  (disabled - chooser will show)"
+            self._default_combo.addItem(label, b["id"])
             if b.get("is_default_fallback", False):
                 current_default = b["id"]
         idx = self._default_combo.findData(current_default)
@@ -499,37 +951,55 @@ class SettingsWindow(QMainWindow):
             row_widget.private_cb.toggled.connect(
                 lambda checked, bid=browser["id"]: self._set_browser_private(bid, checked)
             )
+            # Row saves the new name itself; then refresh everything showing names.
+            row_widget.name_edit.editingFinished.connect(self._on_browser_renamed)
             self._browser_rows.append(row_widget)
 
             item = QListWidgetItem(self._browser_list)
-            item.setSizeHint(row_widget.sizeHint())
+            item.setData(Qt.ItemDataRole.UserRole, browser["id"])
+            item.setSizeHint(QSize(row_widget.sizeHint().width(), row_widget.height()))
             self._browser_list.setItemWidget(item, row_widget)
 
         self._refresh_default_combo()
-    def _persist_browser_order(self) -> None:
+
+    def _on_browser_renamed(self) -> None:
+        self._refresh_default_combo()
+        self.refresh_rules()
+        self._refresh_preview()
+
+    def _persist_browser_order(self, *_) -> None:
+        # Read the order from item data, not item widgets: a drag-and-drop
+        # move can leave the moved row without its widget.
         new_order = []
+        seen = set()
         for i in range(self._browser_list.count()):
-            item = self._browser_list.item(i)
-            widget = self._browser_list.itemWidget(item)
-            if isinstance(widget, BrowserRowWidget):
-                bid = widget.browser_id()
-                browser = self._config.get_browser_by_id(bid)
-                if browser:
-                    browser["order"] = i
-                    new_order.append(browser)
+            bid = self._browser_list.item(i).data(Qt.ItemDataRole.UserRole)
+            browser = self._config.get_browser_by_id(bid)
+            if browser and bid not in seen:
+                seen.add(bid)
+                browser["order"] = len(new_order)
+                new_order.append(browser)
+        # Never lose a browser if the list and config disagree.
+        new_order += [b for b in self._config.browsers if b.get("id") not in seen]
         self._config.browsers = new_order
         self._config.save()
+        # Rebuild after the model signal has finished, restoring row widgets.
+        QTimer.singleShot(0, self._refresh_browser_list)
+        QTimer.singleShot(0, self._refresh_preview)
 
     def _move_browser(self, direction: int) -> None:
         row = self._browser_list.currentRow()
         new_row = row + direction
-        if new_row < 0 or new_row >= self._browser_list.count():
+        if row < 0 or new_row < 0 or new_row >= self._browser_list.count():
             return
         browsers = self._config.browsers
         browsers[row], browsers[new_row] = browsers[new_row], browsers[row]
+        for i, b in enumerate(browsers):
+            b["order"] = i
         self._config.save()
         self._refresh_browser_list()
         self._browser_list.setCurrentRow(new_row)
+        self._refresh_preview()
 
     def _set_browser_enabled(self, browser_id: str, enabled: bool) -> None:
         b = self._config.get_browser_by_id(browser_id)
@@ -548,13 +1018,24 @@ class SettingsWindow(QMainWindow):
 
     def _rescan_browsers(self) -> None:
         from registry import discover_browsers
-        new_browsers = discover_browsers()
-        existing_ids = {b["id"] for b in self._config.browsers}
+        try:
+            new_browsers = discover_browsers()
+        except Exception as exc:
+            QMessageBox.warning(self, "Rescan", f"Browser discovery failed:\n{exc}")
+            return
+        existing = {b["id"]: b for b in self._config.browsers}
         for nb in new_browsers:
-            if nb["id"] not in existing_ids:
+            old = existing.get(nb["id"])
+            if old is None:
                 self._config.browsers.append(nb)
+            elif not os.path.isfile(old.get("exe_path", "")):
+                # The browser moved (e.g. reinstalled): keep the user's
+                # settings, pick up the new executable path.
+                old["exe_path"] = nb["exe_path"]
         self._config.save()
         self._refresh_browser_list()
+        self.refresh_rules()
+        self._refresh_preview()
 
     def _open_default_apps(self) -> None:
         from registry import open_default_apps
@@ -570,18 +1051,39 @@ class SettingsWindow(QMainWindow):
         vbox.setContentsMargins(16, 16, 16, 16)
         vbox.setSpacing(10)
 
-        vbox.addWidget(_section_label("Routing rules — evaluated top to bottom, first match wins"))
+        vbox.addWidget(_section_label("Routing rules"))
+
+        how = QLabel(
+            "When several rules match, the most specific one wins. A rule that "
+            "matches both the link and the app it came from beats one that matches "
+            "only one of them. Then by link condition: exact hostname, wildcard "
+            "hostname, URL prefix, contains, regex (a rule with only an app comes "
+            "last). Between rules of the same type, the longer pattern wins; "
+            "remaining ties go to the rule higher in this list. "
+            "“Never offer” rules always apply on top. "
+            "Use Diagnostics to see how a link is routed."
+        )
+        how.setWordWrap(True)
+        how.setStyleSheet("color: #888; font-size: 12px;")
+        vbox.addWidget(how)
 
         self._rules_table = QTableWidget(0, 4)
         self._rules_table.setHorizontalHeaderLabels(
-            ["Enabled", "Match type", "Pattern", "Browser"]
+            ["Enabled", "Rule", "Action", "Browser"]
         )
-        self._rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self._rules_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr = self._rules_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self._rules_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._rules_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self._rules_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._rules_table.setAlternatingRowColors(True)
         self._rules_table.verticalHeader().setDefaultSectionSize(36)
+        # Connected ONCE here; refreshes block signals while repopulating.
+        self._rules_table.itemChanged.connect(self._on_rule_item_changed)
+        self._rules_table.cellDoubleClicked.connect(lambda *_: self._edit_rule())
         vbox.addWidget(self._rules_table)
 
         btn_row = QHBoxLayout()
@@ -615,38 +1117,63 @@ class SettingsWindow(QMainWindow):
         self._refresh_rules_table()
         return w
 
+    def refresh_rules(self) -> None:
+        """Public: rebuild the rules table (e.g. after a press-and-hold rule)."""
+        if hasattr(self, "_rules_table"):
+            self._refresh_rules_table()
+
     def _refresh_rules_table(self) -> None:
-        self._rules_table.setRowCount(0)
-        for rule in self._config.rules:
-            row = self._rules_table.rowCount()
-            self._rules_table.insertRow(row)
+        bname = self._config.browser_name
+        selected = self._rules_table.currentRow()
+        self._rules_table.blockSignals(True)
+        try:
+            self._rules_table.setRowCount(0)
+            for rule in self._config.rules:
+                row = self._rules_table.rowCount()
+                self._rules_table.insertRow(row)
 
-            # Col 0: enabled checkbox
-            chk = QTableWidgetItem()
-            chk.setCheckState(
-                Qt.CheckState.Checked if rule.get("enabled", True)
-                else Qt.CheckState.Unchecked
-            )
-            chk.setData(Qt.ItemDataRole.UserRole, rule["id"])
-            chk.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._rules_table.setItem(row, 0, chk)
+                # Col 0: enabled checkbox
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                             | Qt.ItemFlag.ItemIsSelectable)
+                chk.setCheckState(
+                    Qt.CheckState.Checked if rule.get("enabled", True)
+                    else Qt.CheckState.Unchecked
+                )
+                chk.setData(Qt.ItemDataRole.UserRole, rule["id"])
+                self._rules_table.setItem(row, 0, chk)
 
-            # Col 1: match type
-            mt = rule.get("match_type", "")
-            self._rules_table.setItem(
-                row, 1, QTableWidgetItem(MATCH_TYPE_LABELS.get(mt, mt))
-            )
+                # Col 1: name (custom or automatic); conditions in the tooltip
+                name_item = QTableWidgetItem(
+                    rule_display_name(rule, bname, self._config.app_name))
+                tip = [f"When: {describe_conditions(rule)}"]
+                for c in rule.get("conditions", []):
+                    tip.append(f"  • {MATCH_TYPE_LABELS.get(c.get('match_type'), '?')}: "
+                               f"{c.get('pattern', '')}")
+                src = describe_source(rule, self._config.app_name)
+                if src:
+                    tip.append(f"Only links {src}")
+                name_item.setToolTip("\n".join(tip))
+                self._rules_table.setItem(row, 1, name_item)
 
-            # Col 2: pattern
-            self._rules_table.setItem(row, 2, QTableWidgetItem(rule.get("pattern", "")))
+                # Col 2: action
+                action = rule.get("action", ACTION_OPEN)
+                self._rules_table.setItem(
+                    row, 2, QTableWidgetItem(ACTION_LABELS.get(action, action)))
 
-            # Col 3: browser name
-            b = self._config.get_browser_by_id(rule.get("browser_id", ""))
-            self._rules_table.setItem(
-                row, 3, QTableWidgetItem(b["name"] if b else rule.get("browser_id", ""))
-            )
-
-        self._rules_table.itemChanged.connect(self._on_rule_item_changed)
+                # Col 3: browser(s)
+                if action == ACTION_OPEN:
+                    text = bname(rule.get("browser_id", ""))
+                    if rule.get("private"):
+                        text += " (private)"
+                else:
+                    ids = rule.get("browsers", []) or []
+                    text = ", ".join(bname(b) for b in ids) if ids else "All"
+                self._rules_table.setItem(row, 3, QTableWidgetItem(text))
+        finally:
+            self._rules_table.blockSignals(False)
+        if 0 <= selected < self._rules_table.rowCount():
+            self._rules_table.setCurrentCell(selected, 1)
 
     def _on_rule_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() != 0:
@@ -683,9 +1210,11 @@ class SettingsWindow(QMainWindow):
         row = self._rules_table.currentRow()
         if row < 0 or row >= len(self._config.rules):
             return
+        name = rule_display_name(self._config.rules[row], self._config.browser_name,
+                                 self._config.app_name)
         reply = QMessageBox.question(
             self, "Delete Rule",
-            "Delete this rule?",
+            f"Delete this rule?\n\n{name}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -696,7 +1225,7 @@ class SettingsWindow(QMainWindow):
     def _move_rule(self, direction: int) -> None:
         row = self._rules_table.currentRow()
         new_row = row + direction
-        if new_row < 0 or new_row >= len(self._config.rules):
+        if row < 0 or new_row < 0 or new_row >= len(self._config.rules):
             return
         rules = self._config.rules
         rules[row], rules[new_row] = rules[new_row], rules[row]
@@ -897,7 +1426,7 @@ class SettingsWindow(QMainWindow):
             spb.valueChanged.connect(self._refresh_preview)
         self._refresh_preview()
 
-        # ── Apply button — always visible below scroll ────────────────
+        # ── Apply button - always visible below scroll ────────────────
         btn_bar = QWidget()
         btn_bar.setFixedHeight(52)
         bbl = QHBoxLayout(btn_bar)
@@ -912,7 +1441,7 @@ class SettingsWindow(QMainWindow):
         return container
 
     def _refresh_preview(self, *_) -> None:
-        if not hasattr(self, "_preview_widget"):
+        if not hasattr(self, "_preview_widget") or getattr(self, "_suppress_preview", False):
             return
         ap = {
             "background_color":   self._bg_color,
@@ -999,7 +1528,7 @@ class SettingsWindow(QMainWindow):
         info = QLabel(
             "To intercept all links system-wide, set URL Router as the default "
             "browser in Windows Settings.\n"
-            "URL Router registers itself automatically — you just need to confirm the choice."
+            "URL Router registers itself automatically - you just need to confirm the choice."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color: #888; font-size: 12px;")
@@ -1088,9 +1617,12 @@ class SettingsWindow(QMainWindow):
                 with open(path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
                 self._config.from_dict(data)
-                self._refresh_browser_list()
-                self._refresh_rules_table()
-                QMessageBox.information(self, "Import", "Configuration imported. Restart may be needed for some changes.")
+                # The startup registry key is the source of truth, not the file.
+                from registry import is_startup_enabled
+                self._config.general["launch_on_startup"] = is_startup_enabled()
+                self._config.save()
+                self._reload_all_controls()
+                QMessageBox.information(self, "Import", "Configuration imported.")
             except Exception as exc:
                 QMessageBox.critical(self, "Import Error", str(exc))
 
@@ -1098,12 +1630,56 @@ class SettingsWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "Reset",
             "Reset all appearance settings and rules to defaults?\n"
-            "Your browser list will be preserved.",
+            "Your browser list and general settings will be preserved.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             self._config.reset_to_defaults()
-            self._refresh_rules_table()
+            self._reload_all_controls()
+
+    def _reload_all_controls(self) -> None:
+        """Re-read every tab from config after an import or reset."""
+        self._refresh_browser_list()
+        self._refresh_rules_table()
+        self._load_appearance_controls()
+        mapping = {"system": 0, "light": 1, "dark": 2}
+        self._theme_combo.blockSignals(True)
+        self._theme_combo.setCurrentIndex(
+            mapping.get(self._config.general.get("theme", "system"), 0))
+        self._theme_combo.blockSignals(False)
+        self._theme_mode = _theme.resolve_theme(self._config.general.get("theme", "system"))
+        self._apply_theme()
+        self._refresh_preview()
+
+    def _load_appearance_controls(self) -> None:
+        self._suppress_preview = True
+        try:
+            self._load_appearance_values()
+        finally:
+            self._suppress_preview = False
+
+    def _load_appearance_values(self) -> None:
+        ap = self._config.appearance
+        self._pos_combo.setCurrentIndex(0 if ap.get("position") == "monitor_center" else 1)
+        self._custom_x.setValue(ap.get("custom_x", 0))
+        self._custom_y.setValue(ap.get("custom_y", 0))
+        self._layout_combo.setCurrentIndex(
+            0 if ap.get("layout", "horizontal") == "horizontal" else 1)
+        self._bg_color = ap.get("background_color", "#1c1c28")
+        self._bg_color_btn.setIcon(QIcon(_swatch(self._bg_color)))
+        self._bg_color_btn.setText(self._bg_color)
+        self._text_color = ap.get("text_color", "#e8e8f0")
+        self._text_color_btn.setIcon(QIcon(_swatch(self._text_color)))
+        self._text_color_btn.setText(self._text_color)
+        self._opacity_slider.setValue(int(round(ap.get("background_opacity", 0.96) * 100)))
+        self._popup_width_spin.setValue(ap.get("popup_width", 520))
+        self._radius_spin.setValue(ap.get("corner_radius", 18))
+        self._padding_spin.setValue(ap.get("padding", 22))
+        self._icon_spin.setValue(ap.get("icon_size", 48))
+        self._font_spin.setValue(ap.get("font_size", 13))
+        self._url_min_font_spin.setValue(ap.get("url_min_font_size", 9))
+        self._show_icons_cb.setChecked(ap.get("show_icons", True))
+        self._show_names_cb.setChecked(ap.get("show_names", True))
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # TAB: Diagnostics
@@ -1135,49 +1711,140 @@ class SettingsWindow(QMainWindow):
         row.addWidget(test_btn)
         vbox.addLayout(row)
 
+        src_row = QHBoxLayout()
+        src_lbl = QLabel("Opened from:")
+        src_lbl.setStyleSheet("color: #888; font-size: 12px;")
+        src_row.addWidget(src_lbl)
+        self._diag_source = QComboBox()
+        self._diag_source.setEditable(True)
+        self._diag_source.setMinimumWidth(260)
+        self._diag_source.lineEdit().setPlaceholderText("not known (or type e.g. slack.exe)")
+        self._diag_source.lineEdit().returnPressed.connect(self._run_diagnostics)
+        self._fill_diag_sources()
+        src_row.addWidget(self._diag_source)
+        src_row.addStretch()
+        vbox.addLayout(src_row)
+
         self._diag_result = QTextEdit()
         self._diag_result.setReadOnly(True)
         self._diag_result.setPlaceholderText("Results will appear here…")
         self._diag_result.setMinimumHeight(200)
         self._diag_result.setStyleSheet("font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px;")
         vbox.addWidget(self._diag_result)
-        vbox.addStretch()
+
+        recent_head = QHBoxLayout()
+        recent_head.addWidget(_section_label("Recent links and the app they came from"))
+        recent_head.addStretch()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_recent_sources)
+        recent_head.addWidget(refresh_btn)
+        vbox.addLayout(recent_head)
+
+        recent_desc = QLabel("Double-click a line to test that link from that app.")
+        recent_desc.setStyleSheet("color: #888; font-size: 12px;")
+        vbox.addWidget(recent_desc)
+
+        self._recent_list = QListWidget()
+        self._recent_list.setMinimumHeight(120)
+        self._recent_list.setStyleSheet("font-family: 'Cascadia Code', 'Consolas', monospace; font-size: 12px;")
+        self._recent_list.itemDoubleClicked.connect(self._test_recent_source)
+        vbox.addWidget(self._recent_list)
+        self._refresh_recent_sources()
         return w
+
+    def _fill_diag_sources(self) -> None:
+        current = self._diag_source.currentText() if self._diag_source.count() else ""
+        self._diag_source.blockSignals(True)
+        self._diag_source.clear()
+        self._diag_source.addItem("", "")
+        known = sorted(self._config.known_apps.items(),
+                       key=lambda kv: -(kv[1].get("last_seen") or 0))
+        for exe, _info in known:
+            self._diag_source.addItem(f"{self._config.app_name(exe)}   ({exe})", exe)
+        self._diag_source.setCurrentText(current)
+        self._diag_source.blockSignals(False)
+
+    def _diag_source_exe(self) -> str:
+        text = self._diag_source.currentText().strip()
+        if not text:
+            return ""
+        idx = self._diag_source.findText(text)
+        if idx >= 0 and self._diag_source.itemData(idx):
+            return self._diag_source.itemData(idx)
+        if text.endswith(")") and "(" in text:
+            text = text.rsplit("(", 1)[1][:-1]
+        return normalize_exe(text)
+
+    def _refresh_recent_sources(self) -> None:
+        import time as _time
+        self._recent_list.clear()
+        entries = list(getattr(self._app, "recent_sources", []) or [])
+        if not entries:
+            item = QListWidgetItem("No links since URL Router started.")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self._recent_list.addItem(item)
+        for e in entries:
+            when = _time.strftime("%H:%M:%S", _time.localtime(e.get("time", 0)))
+            if e.get("exe"):
+                who = f"{e.get('name') or self._config.app_name(e['exe'])} ({e['exe']}, via {e.get('via') or '?'})"
+            else:
+                who = "app not known"
+            item = QListWidgetItem(f"{when}  {who}  {e.get('url', '')}")
+            item.setToolTip(e.get("path") or "")
+            item.setData(Qt.ItemDataRole.UserRole, e)
+            self._recent_list.addItem(item)
+        self._fill_diag_sources()
+
+    def _test_recent_source(self, item: QListWidgetItem) -> None:
+        e = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(e, dict):
+            return
+        self._diag_url.setText(e.get("url", ""))
+        exe = e.get("exe", "")
+        idx = self._diag_source.findData(exe) if exe else 0
+        if idx >= 0:
+            self._diag_source.setCurrentIndex(idx)
+        else:
+            self._diag_source.setCurrentText(exe)
+        self._run_diagnostics()
 
     def _run_diagnostics(self) -> None:
         url = self._diag_url.text().strip()
         if not url:
             return
+        if "://" not in url:
+            url = "https://" + url   # Windows always passes a full URL
 
-        result = diagnose(url, self._config.rules)
-        matched = result["matched_rule"]
-        all_results = result["all_results"]
+        src = self._diag_source_exe()
+        d = decide(url, self._config.rules, self._config.browsers,
+                   source=src or None, app_name=self._config.app_name)
+        bname = self._config.browser_name
 
-        lines = [f"URL: {url}", ""]
-        if matched:
-            mt = MATCH_TYPE_LABELS.get(matched.get("match_type", ""), "?")
-            pat = matched.get("pattern", "")
-            bid = matched.get("browser_id", "")
-            b = self._config.get_browser_by_id(bid)
-            browser_name = b["name"] if b else bid
-            lines.append(f"✓ MATCH FOUND")
-            lines.append(f"  Rule:    {mt} = {pat!r}")
-            lines.append(f"  Browser: {browser_name}")
+        lines = [f"URL: {url}",
+                 f"Opened from: {self._config.app_name(src)} ({src})" if src
+                 else "Opened from: not known", ""]
+        if d.action == "open":
+            lines.append("✓ A RULE OPENS IT")
+            lines.append(f"  Rule:    {rule_display_name(d.rule, bname, self._config.app_name)}")
+            lines.append(f"  Browser: {d.browser.get('name', '?')}"
+                         + ("  (private window)" if d.private else ""))
+        elif d.action == "default":
+            lines.append("→ No rule decided; the DEFAULT FALLBACK opens it")
+            lines.append(f"  Browser: {d.browser.get('name', '?')}")
         else:
-            default = self._config.get_default_browser()
-            default_name = default["name"] if default else "none"
-            lines.append("✗ No rule matched")
-            lines.append(f"  → Chooser popup will appear")
-            lines.append(f"  → Default fallback: {default_name}")
+            if d.action == "ask":
+                lines.append("? An “Always ask” rule shows the CHOOSER")
+                lines.append(f"  Rule:    {rule_display_name(d.rule, bname, self._config.app_name)}")
+            else:
+                lines.append("? Nothing decided; the CHOOSER is shown")
+            offered = ", ".join(b.get("name", "?") for b in d.offered) or "none"
+            lines.append(f"  Offers:  {offered}")
+        if d.excluded:
+            hidden = ", ".join(bname(b) for b in d.excluded)
+            lines.append(f"  Hidden by “Never offer” rules: {hidden}")
 
-        if all_results:
-            lines += ["", "── All rules evaluated ──"]
-            for item in all_results:
-                r = item["rule"]
-                mt = MATCH_TYPE_LABELS.get(r.get("match_type", ""), "?")
-                pat = r.get("pattern", "")
-                hit = "✓" if item["matched"] else "✗"
-                lines.append(f"  {hit}  {mt}: {pat!r}")
+        lines += ["", "── How it was decided ──"]
+        lines += [f"  {step}" for step in d.trace]
 
         self._diag_result.setPlainText("\n".join(lines))
 

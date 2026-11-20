@@ -1,5 +1,5 @@
 """
-chooser.py — Floating browser-chooser popup.
+chooser.py - Floating browser-chooser popup.
 
 Layout
 ──────
@@ -12,8 +12,7 @@ Layout
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-from urllib.parse import urlparse
+from typing import TYPE_CHECKING, Optional
 
 from PyQt6.QtCore import QEvent, QRect, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
@@ -124,7 +123,7 @@ class _URLRow(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
 
-        # Single QTextEdit — toggled between read-only and editable
+        # Single QTextEdit - toggled between read-only and editable
         self._te = QTextEdit(url)
         self._te.setWordWrapMode(__import__('PyQt6.QtGui', fromlist=['QTextOption']).QTextOption.WrapMode.WrapAnywhere)
         self._te.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
@@ -158,7 +157,10 @@ class _URLRow(QWidget):
 
     # ── public ─────────────────────────────────────────────────────
     def current_url(self) -> str:
-        return self._te.toPlainText().strip() or self._url
+        # Line breaks typed (Enter) or pasted while editing would break the URL.
+        text = "".join(self._te.toPlainText().split("\n"))
+        text = text.replace("\r", "").replace("\t", "").strip()
+        return text or self._url
 
     def set_wrap_width(self, text_area_px: int) -> None:
         """Given the pixel width the text box will occupy, compute the exact
@@ -197,11 +199,9 @@ class _URLRow(QWidget):
         self._pencil.setToolTip("Confirm")
 
     def _finish_edit(self) -> None:
-        url = self._te.toPlainText().strip()
-        if url:
-            self._url = url
-        else:
-            self._te.setPlainText(self._url)
+        url = self.current_url()
+        self._url = url
+        self._te.setPlainText(url)
         self._editing = False
         self._te.setReadOnly(True)
         self._apply_style(editing=False)
@@ -216,7 +216,7 @@ class _URLRow(QWidget):
         self._te.setStyleSheet(
             f"QTextEdit {{ color: {c}; font-size: {fs}px; font-family: 'Segoe UI';"
             f"background: {bg}; border: 1px solid {border};"
-            "border-radius: 8px; padding: 4px 8px; }}"
+            "border-radius: 8px; padding: 4px 8px; }"
         )
 
     def _resize_to_content(self) -> None:
@@ -290,7 +290,7 @@ class _BrowserButton(QFrame):
             item_align = Qt.AlignmentFlag.AlignHCenter if layout_dir == "horizontal" else Qt.AlignmentFlag.AlignLeft
             box.addWidget(text_lbl, 0, item_align)
 
-        # Minimum size: driven by whichever is larger — icon or text
+        # Minimum size: driven by whichever is larger - icon or text
         from PyQt6.QtGui import QFontMetrics
         from PyQt6.QtGui import QFont as _QFont
         if show_names:
@@ -364,10 +364,11 @@ class _BrowserButton(QFrame):
 
 class ChooserWindow(QWidget):
     browser_selected = pyqtSignal(str, str, bool)  # browser_id, url, is_private
-    rule_created     = pyqtSignal(str, str)
+    rule_created     = pyqtSignal(str, str, bool)  # browser_id, hostname, is_private
 
     def __init__(self, config: "Config", url: str, parent=None,
-                 preview_mode: bool = False) -> None:
+                 preview_mode: bool = False,
+                 browsers: Optional[list] = None) -> None:
         super().__init__(
             parent,
             Qt.WindowType.FramelessWindowHint
@@ -379,6 +380,8 @@ class ChooserWindow(QWidget):
         self._config       = config
         self._original_url = url
         self._preview_mode = preview_mode
+        # Browsers to offer (rules may narrow the list); None = all enabled.
+        self._browsers     = browsers
         self._build_ui()
         if not preview_mode:
             self._position()
@@ -395,7 +398,8 @@ class ChooserWindow(QWidget):
         popup_w    = ap.get("popup_width",       520)
 
         url_fs     = ap.get("url_min_font_size", 12)
-        browsers   = self._config.get_enabled_browsers()
+        browsers   = (list(self._browsers) if self._browsers
+                      else self._config.get_enabled_browsers())
         has_private = any(b.get("private_mode", False) for b in browsers)
         n = len(browsers) or 1
 
@@ -471,7 +475,7 @@ class ChooserWindow(QWidget):
 
         # ── Fix popup HEIGHT to exactly fit its content ────────────────────
         # Now that the popup width is known, tell the URL row its exact text
-        # width so it computes wrapped height SYNCHRONOUSLY — no racing timers.
+        # width so it computes wrapped height SYNCHRONOUSLY - no racing timers.
         #   text area = popup_w − 2*pad (outer margins)
         #               − 2*32 (pencil + copy buttons)
         #               − 2*6  (URLRow inner layout spacing)
@@ -514,13 +518,12 @@ class ChooserWindow(QWidget):
         self.close()
 
     def _hold_open(self, browser_id: str, private: bool = False) -> None:
-        try:
-            hostname = urlparse(self._original_url).hostname or ""
-            hostname = hostname.lstrip("www.")
-        except Exception:
-            hostname = self._original_url
-        self.rule_created.emit(browser_id, hostname)
-        self.browser_selected.emit(browser_id, self._url_row.current_url(), private)
+        from router import hostname_from_url
+        url = self._url_row.current_url()
+        hostname = hostname_from_url(url)
+        if hostname:   # no hostname (e.g. a malformed URL) → just open it
+            self.rule_created.emit(browser_id, hostname, private)
+        self.browser_selected.emit(browser_id, url, private)
         self.close()
 
     def paintEvent(self, _) -> None:
@@ -539,7 +542,7 @@ class ChooserWindow(QWidget):
         super().keyPressEvent(event)
 
     def changeEvent(self, event) -> None:
-        """Close when the window loses activation — reliable for clicks on
+        """Close when the window loses activation - reliable for clicks on
         any other window or the desktop, including other applications."""
         if not self._preview_mode and event.type() == QEvent.Type.ActivationChange:
             if not self.isActiveWindow():

@@ -1,5 +1,5 @@
 """
-registry.py — Windows registry operations:
+registry.py - Windows registry operations:
   • Register URL Router as a browser (HKCU, no admin)
   • Discover installed browsers
   • Manage startup run key
@@ -133,8 +133,15 @@ def discover_browsers() -> List[Dict]:
                 continue
 
             entry = _read_browser(hive, base, name)
-            if entry and entry["exe_path"] not in seen_exe:
-                seen_exe.add(entry["exe_path"])
+            exe_key = entry["exe_path"].lower() if entry else ""
+            if entry and exe_key not in seen_exe:
+                seen_exe.add(exe_key)
+                # The same key name can exist per-user and machine-wide with
+                # different executables; ids must stay unique (rules use them).
+                if any(b["id"] == entry["id"] for b in found):
+                    import hashlib
+                    digest = hashlib.sha1(exe_key.encode("utf-8")).hexdigest()[:8]
+                    entry["id"] = f"{entry['id']}-{digest}"
                 found.append(entry)
 
         winreg.CloseKey(root)
@@ -156,6 +163,8 @@ def _read_browser(hive, base: str, name: str) -> Optional[Dict]:
             display = winreg.QueryValue(key, None) or name
         except Exception:
             display = name
+        finally:
+            winreg.CloseKey(key)
 
         try:
             cmd_key = winreg.OpenKey(hive, rf"{kpath}\shell\open\command")
@@ -164,11 +173,10 @@ def _read_browser(hive, base: str, name: str) -> Optional[Dict]:
         except Exception:
             return None
 
-        exe = _parse_exe_from_cmd(raw_cmd)
+        exe = os.path.expandvars(_parse_exe_from_cmd(raw_cmd))
         if not exe or not os.path.isfile(exe):
             return None
 
-        winreg.CloseKey(key)
         return {
             "id": name.lower().replace(" ", "_"),
             "name": display,
@@ -188,7 +196,11 @@ def _parse_exe_from_cmd(cmd: str) -> str:
         end = cmd.find('"', 1)
         if end != -1:
             return cmd[1:end]
-    # No quotes: take everything up to the first space or %
+    # No quotes: the path may still contain spaces ("C:\Program Files\...").
+    exe_end = cmd.lower().find(".exe")
+    if exe_end != -1:
+        return cmd[: exe_end + 4]
+    # Otherwise take everything up to the first space or %
     for ch in (" ", "%"):
         idx = cmd.find(ch)
         if idx != -1:

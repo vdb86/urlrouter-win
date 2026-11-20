@@ -1,5 +1,5 @@
 """
-toast.py — Transient desktop notification that fades in/out in the
+toast.py - Transient desktop notification that fades in/out in the
            bottom-right corner of the monitor under the cursor.
 """
 from __future__ import annotations
@@ -58,7 +58,7 @@ class _ToastWidget(QWidget):
         self._anim_out.setStartValue(1.0)
         self._anim_out.setEndValue(0.0)
         self._anim_out.setEasingCurve(QEasingCurve.Type.InCubic)
-        self._anim_out.finished.connect(self.deleteLater)
+        self._anim_out.finished.connect(self._done)
 
         self.show()
         self._anim_in.start()
@@ -66,16 +66,11 @@ class _ToastWidget(QWidget):
         QTimer.singleShot(duration_ms, self._start_fade_out)
 
     def _position_on_monitor(self) -> None:
-        cursor = QApplication.instance()
-        screen = cursor.screenAt(
-            QApplication.instance().primaryScreen().geometry().center()
-        ) if cursor is None else None
-
         from PyQt6.QtGui import QCursor
         pos = QCursor.pos()
         app = QApplication.instance()
         screen = app.screenAt(pos) or app.primaryScreen()
-        sg = screen.geometry()
+        sg = screen.availableGeometry()   # keep clear of the taskbar
 
         margin = 18
         x = sg.right() - self.width() - margin
@@ -84,6 +79,10 @@ class _ToastWidget(QWidget):
 
     def _start_fade_out(self) -> None:
         self._anim_out.start()
+
+    def _done(self) -> None:
+        _active.discard(self)
+        self.deleteLater()
 
     def paintEvent(self, _event) -> None:
         p = QPainter(self)
@@ -103,6 +102,11 @@ class _ToastWidget(QWidget):
         p.end()
 
 
+# Parentless widgets are destroyed when Python drops its last reference, so
+# every toast is kept here until its fade-out finishes.
+_active: set = set()
+
+
 def show_toast(message: str, duration_ms: int = 3000) -> None:
     """Display a non-blocking toast notification."""
-    _ToastWidget(message, duration_ms)
+    _active.add(_ToastWidget(message, duration_ms))

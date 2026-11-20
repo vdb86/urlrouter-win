@@ -1,5 +1,5 @@
 """
-theme.py — Light / dark Windows-style Qt stylesheets and theme detection.
+theme.py - Light / dark Windows-style Qt stylesheets and theme detection.
 """
 from __future__ import annotations
 
@@ -108,7 +108,7 @@ QLabel, QCheckBox, QRadioButton {{
 }}
 
 /* Widgets used as embedded item-row widgets inside list/table
-   views must NEVER show the window background colour —
+   views must NEVER show the window background colour -
    they must let the row's own background paint behind them. */
 QListWidget QWidget,
 QListWidget QLabel,
@@ -261,6 +261,12 @@ QHeaderView::section {{
     padding: 6px 10px;
     font-weight: 600;
     font-size: 12px;
+}}
+QTableCornerButton::section {{
+    background-color: {c['surface2']};
+    border: none;
+    border-bottom: 1px solid {c['border']};
+    border-right: 1px solid {c['border']};
 }}
 
 /* ──────── checkboxes ──────── */

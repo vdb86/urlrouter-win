@@ -1,5 +1,5 @@
 """
-browser_utils.py — Icon extraction from browser executables using Qt's
+browser_utils.py - Icon extraction from browser executables using Qt's
                    built-in QFileIconProvider (no extra Win32 API needed).
                    Also provides the app's own generated icon.
 """
@@ -37,7 +37,7 @@ def get_browser_icon(exe_path: str, size: int = 48) -> QPixmap:
         best = max(available, key=lambda s: s.width())
         px = icon.pixmap(best)
     else:
-        # Provider didn't enumerate sizes — ask for a generous base
+        # Provider didn't enumerate sizes - ask for a generous base
         px = icon.pixmap(QSize(max(size, 256), max(size, 256)))
 
     if px.isNull():
@@ -111,7 +111,7 @@ def _render_icon(sz: int) -> QPixmap:
     p = QPainter(px)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-    # Circle background – deep blue gradient
+    # Circle background - deep blue gradient
     grad = QRadialGradient(sz * 0.45, sz * 0.38, sz * 0.52)
     grad.setColorAt(0.0, QColor("#2979ff"))
     grad.setColorAt(1.0, QColor("#0046cc"))
